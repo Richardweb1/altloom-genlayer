@@ -4,8 +4,7 @@ Altloom is an accessibility-first GenLayer app that turns a public image into co
 
 ## Live deployment
 
-- App: https://projet-8-altloom.vercel.app
-
+- App: https://altloom.vercel.app
 
 ## Network
 
