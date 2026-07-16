@@ -3,6 +3,67 @@
 from genlayer import *
 
 
+ALLOWED_KINDS = ["PHOTO", "ILLUSTRATION", "DIAGRAM", "OTHER"]
+BLOCKED_TERMS = [
+    "i cannot",
+    "as an ai",
+    "image of",
+    "picture of",
+    "probably",
+    "appears to be feeling",
+]
+
+
+def _normalize_kind(value: str) -> str:
+    kind = str(value).strip().upper()
+    if kind not in ALLOWED_KINDS:
+        raise gl.vm.UserError("[LLM_ERROR] invalid image kind")
+    return kind
+
+
+def _clean_text(value: str, min_len: int, max_len: int, field: str) -> str:
+    text = str(value).strip().replace("\n", " ")
+    if not min_len <= len(text) <= max_len:
+        raise gl.vm.UserError("[LLM_ERROR] " + field + " length outside allowed range")
+    if "|" in text:
+        raise gl.vm.UserError("[LLM_ERROR] unsupported pipe character")
+    lowered = text.lower()
+    for term in BLOCKED_TERMS:
+        if term in lowered:
+            raise gl.vm.UserError("[LLM_ERROR] blocked accessibility phrase")
+    return text
+
+
+def _parse_result(candidate) -> dict:
+    if not isinstance(candidate, dict):
+        raise gl.vm.UserError("[LLM_ERROR] expected JSON object")
+
+    return {
+        "kind": _normalize_kind(candidate.get("kind", "")),
+        "alt_text": _clean_text(candidate.get("alt_text", ""), 20, 180, "alt_text"),
+        "long_description": _clean_text(candidate.get("long_description", ""), 50, 500, "long_description"),
+    }
+
+
+def _content_words(text: str) -> set:
+    words = set()
+    for raw in text.lower().replace(",", " ").replace(".", " ").replace(";", " ").split():
+        word = raw.strip("()[]{}:!?\"'")
+        if len(word) > 4:
+            words.add(word)
+    return words
+
+
+def _similar_enough(a: str, b: str) -> bool:
+    left = _content_words(a)
+    right = _content_words(b)
+    if len(left) == 0 or len(right) == 0:
+        return True
+    shared = len(left.intersection(right))
+    smaller = len(left) if len(left) < len(right) else len(right)
+    return shared * 100 >= smaller * 25
+
+
 class Altloom(gl.Contract):
     image_url: str
     alt_text: str
@@ -51,7 +112,7 @@ class Altloom(gl.Contract):
 
         def leader():
             image = gl.nondet.web.render(clean_url, mode="screenshot")
-            return gl.nondet.exec_prompt(
+            result = gl.nondet.exec_prompt(
                 """
 You are an accessibility editor. Inspect the supplied image and return one JSON
 object with exactly these string fields:
@@ -68,38 +129,23 @@ Optional publisher context: """
                 images=[image],
                 response_format="json",
             )
+            return _parse_result(result)
 
         def validator(proposal):
             try:
                 if not isinstance(proposal, gl.vm.Return):
                     return False
 
-                candidate = proposal.calldata
-                if not isinstance(candidate, dict):
-                    return False
+                leader_result = _parse_result(proposal.calldata)
+                validator_result = leader()
 
-                kind = candidate.get("kind", "")
-                alt = candidate.get("alt_text", "")
-                long_desc = candidate.get("long_description", "")
-
-                if kind not in ["PHOTO", "ILLUSTRATION", "DIAGRAM", "OTHER"]:
+                if leader_result["kind"] != validator_result["kind"]:
                     return False
-                if not isinstance(alt, str) or not 20 <= len(alt) <= 180:
+                if not _similar_enough(leader_result["alt_text"], validator_result["alt_text"]):
                     return False
-                if not isinstance(long_desc, str) or not 50 <= len(long_desc) <= 500:
+                if not _similar_enough(leader_result["long_description"], validator_result["long_description"]):
                     return False
-                if "|" in alt or "|" in long_desc:
-                    return False
-                lowered = (alt + " " + long_desc).lower()
-                blocked = [
-                    "i cannot",
-                    "as an ai",
-                    "image of",
-                    "picture of",
-                    "probably",
-                    "appears to be feeling",
-                ]
-                return not any(term in lowered for term in blocked)
+                return True
             except Exception:
                 return False
 
